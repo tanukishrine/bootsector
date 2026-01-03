@@ -1,123 +1,254 @@
 BITS 16
 org 0x500
 
-; BP = PSP (parameter stack pointer)
-; SP = RSP (return stack pointer)
+; bp = PSP (parameter stack pointer)
+; sp = RSP (return stack pointer)
 
-
-%macro	spush	1		; src
+; FORTH MACROS
+%macro	pspush	1	; src
 	sub	bp, 2
 	mov	word [bp], %1
 %endmacro
 
-%macro	spop	1		; dst
+%macro	pspop	1	; dst
 	mov	word %1, [bp]
 	add	bp, 2
 %endmacro
 
-%macro	defword	3		; name, len, link
-	db	$1
-	dw	$3
-	db	$2
+%macro	pspeek	1	; dst
+	mov	word %1, [bp]
 %endmacro
 
-%define	NUL	0
+; WORD STRUCTURE
+%macro	defword	3
+	db	%1	; name (n bytes)
+	dw	%3	; link (2 bytes)
+	db	%2	; len  (1 byte)
+%endmacro		; load (n bytes)
+
+%define	FLAG_IMMEDIATE	0x80	; immediate flag
+%define	MASK_LENGTH	0x7f	; namelen mask
+
+start:		jmp	abort
 
 
-start:		cld				; clear direction flag
-		jmp	abort
+; SYSTEM VARIABLES
+state:		db 0
+latest:		dw 0
+here:		dw end
+in:		dw buffer
+buffer:		times 65 db 0
+curchar:	dw buffer
+curlen:		db 0
 
-		; ( -- )
-		defword	'quit', 4, 0
-quit:		mov	sp, 0x0000
-		jmp	interpret
 
-		; ( -- )
-		defword 'abort', 5, quit
+; DICTIONARY
+
+
+		; key ( -- c )
+		; fetch char c from direct input
+
+		defword 'key', 3, 0
+
+key:		mov	ah, 0x00
+		int	0x16
+		xor	ah, ah
+		pspush	ax
+		ret
+
+
+		; emit ( c -- )
+		; spit char c to output stream
+
+		defword 'emit', 4, key
+
+emit:		pspop	ax
+		mov	ah, 0x0e
+		int	0x10
+		ret
+
+
+		; abort ( -- )
+		; reset PS and jump to quit
+
+		defword 'abort', 5, emit
+
 abort:		mov	bp, 0xff00
 		jmp	quit
 
-		; ( a -- )
-		defword 'execute', 7, abort
-execute:	spop	ax
-		jmp	ax
 
-		; ( -- )
-		defword 'interpret', 9, execute
-interpret:	call	word_
-		call	dot
-		call	space
-		call	dot
-		call	nl_out
-		jmp	interpret
-		
-in:		dw buffer		; in>
-buffer:		times 65 db 0		; in(
+		; quit ( -- )
+		; reset RS and clear the buffer
+		; and jump to interpret loop
 
-zequ:		spop	ax
-		test	ax, ax
+		defword 'quit', 4, abort
+
+quit:		mov	sp, 0x0000
+
 		xor	ax, ax
-		jnz	.false
-		not	ax
-	.false	spush	ax
+		mov	cx, 64
+		mov	di, buffer
+		rep	stosb
+
+		jmp	interpret
+
+
+		; interpret ( -- )
+		; main interpret loop
+
+		defword 'interpret', 9, quit
+
+interpret:	; read next word
+		call	toword		; ( -- sa sl )
+
+		; is a number?
+		call	parse		; ( sa sl -- n? f )
+		pspop	ax		; ( n? f -- n? )
+		test	ax, ax
+		jnz	.num
+
+		; is a word?
+		call	curword		; ( -- sa sl )
+		call	find		; ( sa sl -- w? f )
+		pspop	ax		; ( w? f -- w? )
+		test	ax, ax
+		jnz	.word
+
+		; not a word
+		call	nl_out		; ( -- )
+		call	curword		; ( -- sa sl )
+		call	stype		; ( sa sl -- )
+		pspush	.err		; ( -- sa )
+		pspush	15		; ( -- sa sl )
+		call	stype		; ( sa sl -- )
+		jmp	abort
+
+	.err:	db ' word not found'
+
+	.num:	mov	al, [state]
+		test	al, al
+		jz	interpret
+
+		call	litn
+		jmp	interpret
+
+	.word:	mov	al, [state]
+		test	al, al
+		jz	.run
+
+		; immediate word?
+		mov	bx, [bp]
+		mov	al, [bx-1]
+		and	al, FLAG_IMMEDIATE
+		test	al, al
+		jnz	.run
+
+		call	compile_comma
+		jmp	interpret
+
+	.run:	call	execute
+		jmp	interpret
+
+
+		; stype ( sa sl -- )
+		; emit all chars of string
+
+		defword 'stype', 5, 0
+
+stype:		pspop	cx
+		pspop	si
+		mov	ah, 0x0e
+	.next:	lodsb
+		int	0x10
+		loop	.next
 		ret
 
 
-		; ( -- sa sl )
-word_:		call	in_in
-		spop	ax
-		cmp	ax, 0x20
-		jbe	word_
+		; word ( -- sa sl )
+		; read one word from buffered input
+		; update curchar and curlen
 
+		defword 'word', 4, 0
+
+toword:		call	tochar
+		pspop	ax
+		cmp	ax, 0x20
+		jbe	toword
 		mov	ax, [in]
 		dec	ax
-		spush	ax
+		pspush	ax
+		mov	[curchar], ax
 		xor	cx, cx
-
 	.next:	inc	cx
-		call	in_in
-		spop	ax
+		call	tochar
+		pspop	ax
 		cmp	ax, 0x20
 		ja	.next
-
-		spush	cx
+		pspush	cx
+		mov	[curlen], cl
 		ret
 
 
-		defword 'in<', 3, NUL
-		; ( -- c ) read one char from input buffer, if EOL read new line
-in_in:		mov	bx, [in]
-		mov	al, [bx]
+		; curword ( -- sa sl )
+		; yield the last read word
+
+		defword 'curword', 7, 0
+
+curword:	mov	ax, [curchar]
+		pspush	ax
+		mov	al, [curlen]
 		xor	ah, ah
-		spush	ax
-		test	al, al
-		jz	.query
+		pspush	ax
+		ret
+
+
+		; in< ( -- c )
+		; read one char from buffered input
+		; if end of input, read new line
+
+		defword 'in<', 3, 0
+
+tochar:		mov	bx, [in]
+		cmp	bx, buffer+64
+		jbe	.skip
+		call	rdln
+		mov	bx, buffer
+	.skip:	mov	al, [bx]
+		xor	ah, ah
+		pspush	ax
 		inc	bx
 		mov	[in], bx
 		ret
 
-	.query:	; flag for EOL?
 
-		defword 'query', 5, NUL
-		; ( -- ) fill input buffer
-query:		mov	di, buffer
+		; rdln ( -- )
+		; feed a line to the buffered input
+
+		defword 'rdln', 4, 0
+
+rdln:		pspush	.ok
+		pspush	5
+		call	stype
+
+		mov	di, buffer
 
 	.next	cmp	di, buffer+64	; buffer full?
 		je	.cr		; submit
 
 		call	key
-		spop	ax
+		pspop	ax
+
 		cmp	al, 0x0d
 		je	.cr
 
 		cmp	al, 0x08
 		je	.bs
 
-		cmp	al, 0x20	; whitespace character?
+		cmp	al, 0x20	; control character?
 		jb	.next		; do nothing
 
 		stosb			; store string byte
-		spush	ax
+		pspush	ax
 		call	emit
 		jmp	.next
 
@@ -129,310 +260,304 @@ query:		mov	di, buffer
 		call	bs_out
 		jmp	.next
 
-	.cr:	xor	al, al		; append input with null-terminal
-		stosb
-		mov	bx, in
-		mov	word [bx], buffer
+	.cr:	xor	al, al		; flush rest of line with null
+	.null:	stosb			
+		cmp	di, buffer+64
+		jbe	.null
+		mov	bx, in		; reset input ptr
+		mov	[bx], buffer
 		ret
 
-parse:		; ( sa sl -- n? f ) parses string as a number
+	.ok	db ' ok', 13, 10
 
-key:		; ( -- c ) get char c from direct input
-		mov	ah, 0x00
-		int	0x16
-		xor	ah, ah
-		spush	ax
-		ret
-		
 
-emit:		; ( c -- ) spit char c to output stream
-		spop	ax
-		mov	ah, 0x0e
-		int	0x10
-		ret
+		; parse ( sa sl -- n? f )
+		; convert string as a number
 
-		defword "emitln", 6, NUL
-		; ( a -- ) 'emit' line at addr a
-_emitln:	spop	si
-		mov	cl, 64
+		defword 'parse', 5, 0
+
+parse:		pspop	cx
+		pspop	si
+		xor	ah, ah	; current char
+		xor	bx, bx	; result
+
 	.next:	lodsb
-		test	al, al
-		jz	.done
-		spush	ax
-		call	emit
-		test	cl, cl
-		jz	.done
-		dec	cl
-		jmp	.next
-	.done:	ret
+		mul	bx, 10
+		sub	al, '0'
+		jb	.nan
+		cmp	al, 10
+		jae	.nan
+		add	bx, ax
+		loop	.next
+		pspush	bx
+		pspush	-1
+		ret
 
-emitln:		call	in_in	; ( -- c )
-		spop	ax
-		test	al, al
-		jz	.done
-		spush	ax
-		call	emit
-		jmp	emitln
-	.done:	ret
+	.nan:	pspush	0
+		ret
 
-		defword "nl>", 3, NUL
-		; emit newline
-nl_out:		spush	0x0d ; CR
-		call	emit
-		spush	0x0a ; LF
+
+		; lit ( -- n ) runtime
+
+lit:		pop	si
+		lodsw
+		pspush	ax
+		push	si
+		ret
+
+
+		; litn ( n -- )
+		; write n as a literal
+
+		defword 'litn', 4, 0
+
+litn:		mov	al, 0xe8	; call opcode
+		mov	di, [here]
+		stosb
+
+		mov	ax, lit		; relative addressing
+		sub	ax, di
+		sub	ax, 2
+		stosw
+
+		pspop	ax		; store n
+		stosw
+
+		mov	[here], di
+		ret
+
+
+		; find ( sa sl -- w? f )
+		defword 'find', 4, 0
+find:		pspop	ax		; len
+		pspop	dx		; addr
+		mov	bx, [latest]	; curr
+
+	.loop:	mov	cl, [bx-1]	; same length?
+		and	cl, 0x7f	; ignore immediate flag
+		cmp	al, cl
+		jne	.skip
+
+		mov	si, dx
+		mov	di, bx
+		sub	di, 3
+		sub	di, ax		; beginning of name
+		mov	cx, ax
+		repz	cmpsb
+		jz	.found	
+
+	.skip:	mov	bx, [bx-3]	; next entry
+		cmp	bx, 0
+		jnz	.loop
+
+		pspush	0
+		ret
+
+	.found:	pspush	bx
+		pspush	-1
+		ret
+
+
+		; execute ( w -- )
+		; jump IP to addr w
+		defword 'execute', 7, 0
+execute:	pspop	ax
+		jmp	ax
+
+
+		; compile, ( w -- )
+		; append a call to wordref w to here
+
+		defword 'compile,', 8, 0
+
+compile_comma:	mov	al, 0xe8 ; call opcode
+		mov	di, [here]
+		stosb
+
+		pspop	ax ; wordref
+		sub	ax, di
+		sub	ax, 2
+		stosw
+
+		mov	[here], di
+		ret
+
+
+		; header ( sa sl -- )
+		; append a new header with name s
+
+		defword 'header', 6, 0
+
+header:		pspop	bx
+		mov	cx, bx
+		pspop	si
+		mov	di, [here]
+		rep	movsb
+		mov	ax, [latest]
+		stosw
+		mov	al, bl
+		stosb
+		mov	[latest], di
+		mov	[here], di
+		ret
+
+
+		; create x ( -- )
+		; append a new header with name x
+
+		defword 'create', 6, 0
+
+create:		call	toword		; ( -- sa sl )
+		call	header		; ( sa sl -- )
+		ret
+
+
+		; [ ( -- ) IMMEDIATE
+		; to immediate mode
+
+		defword '[', 1 | FLAG_IMMEDIATE, to_compile
+
+to_immediate:	mov	byte [state], 0
+		ret
+
+
+		; ] ( -- )
+		; to compile mode
+
+		defword ']', 1, 0
+
+to_compile:	mov	byte [state], -1
+		ret
+
+
+		; exit ( -- )
+		; compile exit from a word
+
+		defword 'exit', 4, 0
+
+exit:		mov	al, 0xc3 ; ret
+		mov	di, [here]
+		stosb
+		mov	[here], di
+		ret
+
+
+		; , ( n -- )
+		; write word n to here
+
+		defword 'c,', 2, 0
+
+byte_comma:	pspop	ax
+		mov	di, [here]
+		stosb
+		mov	[here], di
+		ret
+
+
+		; , ( c -- )
+		; write byte c to here
+
+		defword ',', 1, 0
+
+comma:		pspop	ax
+		mov	di, [here]
+		stosw
+		mov	[here], di
+		ret
+
+
+		; []= ( a1 a2 u -- f )
+		; compare u bytes between a1 and a2
+
+		defword '[]=', 3, 0
+
+scmp:		pspop	cx
+		pspop	si
+		pspop	di
+		repe	cmpsb
+		jz	.true
+		pspush	0
+		ret
+	.true:	pspush	-1
+		ret
+
+
+		; scnt ( -- n ) size of PS in bytes
+
+		defword 'scnt', 4, 0
+
+scnt:		mov	ax, 0xff00
+		sub	ax, bp
+		pspush	ax
+		ret
+
+
+		; rcnt ( -- n ) size of RS in bytes
+
+		defword 'rcnt', 4, 0
+
+rcnt:		mov	ax, 0x0000
+		sub	ax, sp
+		pspush	ax
+		ret
+
+
+		; spc> ( -- ) emit space character
+
+		defword 'spc>', 4, 0
+
+spc_out:	pspush	0x20 ; SP
 		call	emit
 		ret
 
-		defword "bs>", 3, NUL
-		; ( -- ) delete previous char in TTY mode
-bs_out:		spush	0x08
-		call	emit
-		spush	0x20
-		call	emit
-		spush	0x08
-		call	emit
+
+		; nl> ( -- ) emit newline
+	
+		defword 'nl>', 3, 0
+
+nl_out:		pspush	.nl
+		pspush	2
+		call	stype
 		ret
 
-space:		spush 0x20
-		call emit
+		; CR, LF
+	.nl:	db 0x0d, 0x0a
+
+
+		; bs> ( -- )
+		; delete prev char in TTY mode
+
+		defword	'bs>', 3, 0
+
+bs_out:		pspush	.bs
+		pspush	3
+		call	stype
 		ret
 
-		defword '.', 1, NUL	; ( n -- )
-dot:		spop ax
+		; BS, SPC, BS
+	.bs:	db 0x08, 0x20, 0x08
+
+
+		; . ( n -- )
+		; print n in its decimal form
+
+		defword '.', 1, 0
+
+dot:		pspop ax
 	.digit:	xor dx, dx
 		mov bx, 10
-		div bx		; quotient in ax, remainder in dx
+		div bx
 		cmp ax, 0
 		jz .zero
-
 		push dx
 		call .digit
 		pop dx
 	.zero:	push ax
 		mov al, dl
 		add al, '0'
-		spush ax
+		pspush ax
 		call emit
 		pop ax
 		ret
 
-
-nop: jmp nop
-
-; exit
-; scnt
-; rcnt
-; (b)
-; (n)
-; (br)
-; (?br)
-; (next)
-; c@
-; @
-; c!
-; !
-; 1+
-; 1-
-; +
-; -
-; <
-; <<
-; >>
-; <<8
-; >>8
-; and
-; or
-; xor
-; not
-; *
-; /mod
-; dup
-; ?dup
-; drop
-; swap
-; over
-; rot
-; rot>
-; r@
-; >r
-; r>
-; r~
-; move
-; []=
-; find
-; [c]?
-; a>
-; >a
-; a>r
-; r>a
-; a+
-; a-
-; ac@
-; ac!
-; ioerr
-; 'current
-; 'here
-; nl
-; ln<
-; 'emit
-; 'key?
-; 'curword
-; '(wnf)
-; 'in(
-; 'in>
-; inbuf
-; current
-; here
-; emit
-; key?
-; in(
-; in>
-; lnsz
-; noop
-; =
-; >
-; 0<
-; 0>=
-; >=
-; <=
-; 2drop
-; 2dup
-; nip
-; tuck
-; =><=
-; /
-; mod
-; <>
-; min
-; max
-; -^
-; rshift
-; lshift
-; l|m
-; +!
-; ac@+
-; ac!+
-; leave
-; to
-; c@+
-; c!+
-; allot
-; fill
-; allot0
-; immediate
-; ,
-; c,
-; l,
-; m,
-; move,
-; jmpi!
-; calli!
-; crc16
-; stype
-; eot
-; bs
-; lf
-; cr
-; spc
-; spc>
-; nl>
-; stack?
-; litn
-; fmtd
-; fmtx
-; fmtx
-; .
-; .x
-; .x
-; parse
-; key
-; in)
-; bs?
-; ws?
-; lntype
-; rdln
-; in<?
-; in<
-; in$
-; ,"
-; toword
-; curword
-; word
-; word!
-; (wnf)
-; run1
-; nc,
-; code
-; '?
-; '
-; forget
-; s=
-; waitw
-; [if]
-; [then]
-; _bchk
-; dump
-; psdump
-; .s
-; (emit)
-; (key?)
-; bye
-; (blk@)
-; (blk!)
-; blk(
-; blk)
-; 'blk>
-; blk>
-; blkdty
-; blkin>
-; blk$
-; blk!
-; flush
-; blk@
-; blk!!
-; wipe
-; copy
-; lnlen
-; emitln
-; list
-; index
-; \s
-; load
-; loadr
-; ed
-; ve
-; me
-; archm
-; rxtx
-; xcomp
-; blksz$
-; init
-; ;code
-; create
-; doer
-; _
-; does>
-; alias
-; value
-; values
-; consts
-; boot
-; xtcomp
-; :
-; if
-; then
-; else
-; (
-; \
-; s"
-; ."
-; abort"
-; begin
-; again
-; until
-; next
-; [
-; ]
-; compile
-; [compile]
-; [']
+end:		db 237
