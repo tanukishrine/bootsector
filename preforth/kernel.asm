@@ -34,7 +34,7 @@ start:		jmp	abort
 
 ; SYSTEM VARIABLES
 state:		db 0
-latest:		dw 0
+latest:		dw scmp
 here:		dw end
 in:		dw buffer
 buffer:		times 65 db 0
@@ -43,7 +43,6 @@ curlen:		db 0
 
 
 ; DICTIONARY
-
 
 		; key ( -- c )
 		; fetch char c from direct input
@@ -153,7 +152,7 @@ interpret:	; read next word
 		; stype ( sa sl -- )
 		; emit all chars of string
 
-		defword 'stype', 5, 0
+		defword 'stype', 5, interpret
 
 stype:		pspop	cx
 		pspop	si
@@ -168,7 +167,7 @@ stype:		pspop	cx
 		; read one word from buffered input
 		; update curchar and curlen
 
-		defword 'word', 4, 0
+		defword 'word', 4, stype
 
 toword:		call	tochar
 		pspop	ax
@@ -179,11 +178,13 @@ toword:		call	tochar
 		pspush	ax
 		mov	[curchar], ax
 		xor	cx, cx
+
 	.next:	inc	cx
 		call	tochar
 		pspop	ax
 		cmp	ax, 0x20
 		ja	.next
+
 		pspush	cx
 		mov	[curlen], cl
 		ret
@@ -192,7 +193,7 @@ toword:		call	tochar
 		; curword ( -- sa sl )
 		; yield the last read word
 
-		defword 'curword', 7, 0
+		defword 'curword', 7, toword
 
 curword:	mov	ax, [curchar]
 		pspush	ax
@@ -206,7 +207,7 @@ curword:	mov	ax, [curchar]
 		; read one char from buffered input
 		; if end of input, read new line
 
-		defword 'in<', 3, 0
+		defword 'in<', 3, curword
 
 tochar:		mov	bx, [in]
 		cmp	bx, buffer+64
@@ -224,7 +225,7 @@ tochar:		mov	bx, [in]
 		; rdln ( -- )
 		; feed a line to the buffered input
 
-		defword 'rdln', 4, 0
+		defword 'rdln', 4, tochar
 
 rdln:		pspush	.ok
 		pspush	5
@@ -274,7 +275,7 @@ rdln:		pspush	.ok
 		; parse ( sa sl -- n? f )
 		; convert string as a number
 
-		defword 'parse', 5, 0
+		defword 'parse', 5, rdln
 
 parse:		pspop	cx
 		pspop	si
@@ -309,7 +310,7 @@ lit:		pop	si
 		; litn ( n -- )
 		; write n as a literal
 
-		defword 'litn', 4, 0
+		defword 'litn', 4, parse
 
 litn:		mov	al, 0xe8	; call opcode
 		mov	di, [here]
@@ -328,7 +329,7 @@ litn:		mov	al, 0xe8	; call opcode
 
 
 		; find ( sa sl -- w? f )
-		defword 'find', 4, 0
+		defword 'find', 4, litn
 find:		pspop	ax		; len
 		pspop	dx		; addr
 		mov	bx, [latest]	; curr
@@ -360,7 +361,7 @@ find:		pspop	ax		; len
 
 		; execute ( w -- )
 		; jump IP to addr w
-		defword 'execute', 7, 0
+		defword 'execute', 7, find
 execute:	pspop	ax
 		jmp	ax
 
@@ -368,7 +369,7 @@ execute:	pspop	ax
 		; compile, ( w -- )
 		; append a call to wordref w to here
 
-		defword 'compile,', 8, 0
+		defword 'compile,', 8, execute
 
 compile_comma:	mov	al, 0xe8 ; call opcode
 		mov	di, [here]
@@ -386,7 +387,7 @@ compile_comma:	mov	al, 0xe8 ; call opcode
 		; header ( sa sl -- )
 		; append a new header with name s
 
-		defword 'header', 6, 0
+		defword 'header', 6, compile_comma
 
 header:		pspop	bx
 		mov	cx, bx
@@ -405,7 +406,7 @@ header:		pspop	bx
 		; create x ( -- )
 		; append a new header with name x
 
-		defword 'create', 6, 0
+		defword 'create', 6, header
 
 create:		call	toword		; ( -- sa sl )
 		call	header		; ( sa sl -- )
@@ -415,7 +416,7 @@ create:		call	toword		; ( -- sa sl )
 		; [ ( -- ) IMMEDIATE
 		; to immediate mode
 
-		defword '[', 1 | FLAG_IMMEDIATE, to_compile
+		defword '[', 1 | FLAG_IMMEDIATE, create
 
 to_immediate:	mov	byte [state], 0
 		ret
@@ -424,7 +425,7 @@ to_immediate:	mov	byte [state], 0
 		; ] ( -- )
 		; to compile mode
 
-		defword ']', 1, 0
+		defword ']', 1, to_immediate
 
 to_compile:	mov	byte [state], -1
 		ret
@@ -433,7 +434,7 @@ to_compile:	mov	byte [state], -1
 		; exit ( -- )
 		; compile exit from a word
 
-		defword 'exit', 4, 0
+		defword 'exit', 4, to_compile
 
 exit:		mov	al, 0xc3 ; ret
 		mov	di, [here]
@@ -441,11 +442,26 @@ exit:		mov	al, 0xc3 ; ret
 		mov	[here], di
 		ret
 
+		; : x ( -- )
+		; create a new word definition with name x
+
+		defword ':', 1, exit
+colon:		call	create
+		call	to_compile
+		ret
+
+		; ; ( -- )
+		; end current word definition
+
+		defword ';', 1 | FLAG_IMMEDIATE, colon
+semicolon:	call	exit
+		call	to_immediate
+		ret
 
 		; , ( n -- )
 		; write word n to here
 
-		defword 'c,', 2, 0
+		defword 'c,', 2, semicolon
 
 byte_comma:	pspop	ax
 		mov	di, [here]
@@ -457,7 +473,7 @@ byte_comma:	pspop	ax
 		; , ( c -- )
 		; write byte c to here
 
-		defword ',', 1, 0
+		defword ',', 1, byte_comma
 
 comma:		pspop	ax
 		mov	di, [here]
@@ -466,25 +482,9 @@ comma:		pspop	ax
 		ret
 
 
-		; []= ( a1 a2 u -- f )
-		; compare u bytes between a1 and a2
-
-		defword '[]=', 3, 0
-
-scmp:		pspop	cx
-		pspop	si
-		pspop	di
-		repe	cmpsb
-		jz	.true
-		pspush	0
-		ret
-	.true:	pspush	-1
-		ret
-
-
 		; scnt ( -- n ) size of PS in bytes
 
-		defword 'scnt', 4, 0
+		defword 'scnt', 4, comma
 
 scnt:		mov	ax, 0xff00
 		sub	ax, bp
@@ -494,7 +494,7 @@ scnt:		mov	ax, 0xff00
 
 		; rcnt ( -- n ) size of RS in bytes
 
-		defword 'rcnt', 4, 0
+		defword 'rcnt', 4, scnt
 
 rcnt:		mov	ax, 0x0000
 		sub	ax, sp
@@ -504,7 +504,7 @@ rcnt:		mov	ax, 0x0000
 
 		; spc> ( -- ) emit space character
 
-		defword 'spc>', 4, 0
+		defword 'spc>', 4, rcnt
 
 spc_out:	pspush	0x20 ; SP
 		call	emit
@@ -513,7 +513,7 @@ spc_out:	pspush	0x20 ; SP
 
 		; nl> ( -- ) emit newline
 	
-		defword 'nl>', 3, 0
+		defword 'nl>', 3, spc_out
 
 nl_out:		pspush	.nl
 		pspush	2
@@ -527,7 +527,7 @@ nl_out:		pspush	.nl
 		; bs> ( -- )
 		; delete prev char in TTY mode
 
-		defword	'bs>', 3, 0
+		defword	'bs>', 3, nl_out
 
 bs_out:		pspush	.bs
 		pspush	3
@@ -541,7 +541,7 @@ bs_out:		pspush	.bs
 		; . ( n -- )
 		; print n in its decimal form
 
-		defword '.', 1, 0
+		defword '.', 1, bs_out
 
 dot:		pspop ax
 	.digit:	xor dx, dx
@@ -559,5 +559,22 @@ dot:		pspop ax
 		call emit
 		pop ax
 		ret
+
+
+		; []= ( a1 a2 u -- f )
+		; compare u bytes between a1 and a2
+
+		defword '[]=', 3, dot
+
+scmp:		pspop	cx
+		pspop	si
+		pspop	di
+		repe	cmpsb
+		jz	.true
+		pspush	0
+		ret
+	.true:	pspush	-1
+		ret
+
 
 end:		db 237

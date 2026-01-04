@@ -20,7 +20,7 @@ kernel.img:
 	nasm kernel.asm -o $@
 
 load: build
-	truncate -s 2048 disk.img
+	truncate -s 4096 disk.img
 	diskutil unmountDisk /dev/disk4
 	sudo dd if=disk.img of=/dev/rdisk4 bs=512 status=progress
 	sync
