@@ -21,7 +21,7 @@ kernel.img:
 
 load: build
 	truncate -s 4096 disk.img
-	diskutil unmountDisk /dev/disk4
-	sudo dd if=disk.img of=/dev/rdisk4 bs=512 status=progress
+	diskutil unmountDisk /dev/disk6
+	sudo dd if=disk.img of=/dev/rdisk6 bs=512 status=progress
 	sync
-	diskutil eject /dev/disk4
+	diskutil eject /dev/disk6
